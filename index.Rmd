@@ -1,0 +1,211 @@
+---
+title: "How anomalous was this summers' rainfall?"
+author: "Tynan Burkhardt"
+date: "2023-03-11"
+categories: ["R"]
+tags: ["Rainfall","New Zealand"]
+---
+
+<style>
+p.caption {
+  font-size: 0.6em;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, warning = FALSE, message = FALSE)
+```
+```{r echo = F}
+library(tidyverse)
+library(lubridate)
+library(broom)
+
+load('rain_data.RDATA')
+load('enso_data.RDATA')
+divide_line <- function(x, y, at = 0) {
+  df <- data.frame(x, ymin = at, ymax = y)
+  df$sign <- sign(df$ymax - df$ymin)
+  df <- df[order(df$x), ]
+  df$id <- with(rle(df$sign), rep.int(seq_along(values), lengths))
+  
+  crossover <- which(c(FALSE, diff(df$id) == 1))
+  crossover <- sort(c(crossover, crossover - 1))
+  splitter  <- rep(seq_len(length(crossover) / 2), each = 2)
+  crossover <- lapply(split(df[crossover, ], splitter), find_isect)
+  
+  df <- do.call(rbind, c(list(df), crossover))
+  df[order(df$x),]
+}
+
+find_isect <- function(df) {
+  list2env(df, envir = rlang::current_env())
+  dx <- x[1] - x[2]
+  dy <- ymin[1] - ymin[2]
+  t <- (-1 * (ymin[1] - ymax[1]) * dx) / (dx * (ymax[1] - ymax[2]) - dy * dx)
+  df$x <- x[1] + t * -dx
+  df$ymin <- df$ymax <- ymin[1] + t * -dy
+  return(df)
+}
+
+dec_to_mar <- filter(rain_data, month(date_local) %in% c(12,1,2)) %>% 
+  mutate(
+    days_from_dec1 = ifelse(month(date_local) == 12,day(date_local),yday(date_local) + 31),
+    summer = ifelse(
+      month(date_local) == 12, 
+      paste0(year(date_local), '/', str_extract(year(date_local) + 1, '\\d{2}$')),
+      paste0(year(date_local)-1, '/', str_extract(year(date_local), '\\d{2}$'))
+    ),
+    fake_date = as.Date(as.Date('2022-11-30') + days_from_dec1)
+  ) 
+
+summer_rain <- group_by(dec_to_mar, summer) %>% 
+  summarise(rain = sum(amount_mm), .groups = 'drop') %>% 
+  mutate(year = as.numeric(str_extract(summer, '^\\d{4}'))) 
+
+rain_stats <- left_join(
+  group_by(dec_to_mar, summer) %>% 
+    summarise(
+      total_wet_days = sum(amount_mm > 0),
+      total_dry_days = sum(amount_mm == 0),
+      total_rain = sum(amount_mm),
+      .groups = 'drop'
+    ) %>% arrange(desc(total_wet_days)) %>% 
+    mutate(total_days = total_wet_days + total_dry_days),
+  group_by(filter(dec_to_mar, amount_mm > 0), summer) %>% 
+    summarise(average_rain = mean(amount_mm), median_rain = median(amount_mm)),
+  by = 'summer'
+) %>% filter(total_days > 88)
+
+suffix <- function(x){case_when(x %in% c(11,12,13) ~ "th",
+                      x %% 10 == 1 ~ 'st',
+                      x %% 10 == 2 ~ 'nd',
+                      x %% 10 == 3 ~'rd',
+                      TRUE ~ "th")}
+
+average_summer <- summer_rain %>% 
+  mutate(diff = abs(rain - mean(summer_rain$rain))) %>% 
+  filter(diff == min(diff)) %>% {.$summer[1]}
+
+enso_correlation <- inner_join(
+  enso_data %>% filter(month(Date) %in% c(12,1,2)) %>%
+    mutate(
+      year = ifelse(month(Date) == 12, year(Date), year(Date)-1)
+    ) %>% group_by(year) %>%
+    summarise(index = mean(Index)),
+  summer_rain,
+  by = 'year'
+) 
+
+lm1 <- lm(rain ~ index, data = enso_correlation)
+lm2 <- lm(rain ~ index, data = enso_correlation[-58,])
+lm3 <- lm(log(rain) ~ index, data = enso_correlation)
+lm3_data <- tibble(index = seq(min(enso_correlation$index), max(enso_correlation$index), length = 100)) %>% 
+  mutate(rain = exp(predict(lm3, newdata = .)))
+```
+
+Now that summer has come to an end in New Zealand, we can finally put some numbers on how '[unprecedented](https://www.theguardian.com/world/2023/feb/13/cyclone-gabrielle-new-zealand-declares-national-state-of-emergency)' it really was. We saw wide scale flooding across much of the North Island, two cyclones, over 10,000 people displaced and 12 deaths. Certainly in my lifetime, it was the worst weather we have had over summer by a long shot. But what about before that?
+
+Luckily, weather is one of the most standardised and widely collected data types there are. On top of that, many government agencies provide this data free of charge. New Zealand's National Institute of Water and Atmospheric Research (NIWA) provides a free-to-use climate database called [CliFlo](https://cliflo.niwa.co.nz/). From CliFlo, I obtained daily rainfall data from Auckland Airport going all the way back to 1965.
+
+Although New Zealand had a wet year in general, summer was particularly extraordinary. `r round(summer_rain$rain[summer_rain$year == 2022])` mm fell over the 2022/23 summer. Compare this with the next wettest summer over the past 58 years, `r pull(arrange(summer_rain, desc(rain)), summer) %>% .[2]` with `r round(pull(arrange(summer_rain, desc(rain)), rain) %>% .[2])` mm of rain, and the average of the previous 57 years, `r round(mean(summer_rain$rain[summer_rain$year != 2022]))` mm (\@ref(fig:summer-rainfall-plot)).
+
+```{r summer-rainfall-plot, echo = FALSE, fig.dim = c(8, 5), fig.cap = 'Summer (Dec through Feb) rainfall from 1965 to present at Auckland Airport. The x-axis indicates which year the summer began (e.g. 2022 is the 2022/23 summer).'}
+rain_plot <- ggplot(summer_rain, aes(year, rain)) + 
+  geom_bar(stat = 'identity', fill = '#92BAD2', colour = 'black') + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  +
+  scale_colour_manual(values = c('red','blue'))  +
+  coord_cartesian(xlim = c(min(summer_rain$year), max(summer_rain$year))) + 
+  scale_y_continuous(expand = c(0,0,0.05,0)) +
+  theme_bw() + 
+  theme(
+    panel.grid = element_blank(),
+    axis.title.y = element_text(colour = '#92BAD2', face = 'bold'),
+  ) +
+  scale_x_continuous(
+    breaks = seq(min(summer_rain$year), max(summer_rain$year), by = 4)
+  ) + xlab(NULL) + ylab('Summer Rainfall (mm)')
+
+rain_plot
+```
+
+Compared to the most average summer for rainfall in the last 58 years, `r average_summer`, differences in frequency and volume are striking (\@ref(fig:average-comparison-plot)). There were two extreme rainfall events (>50mm), which were both well above any typical rainy summer's day and there were many more days in 2022/23 with at least some amount of rain. On average, we (Auckland Airport) have `r round(mean(rain_stats$total_wet_days))` days with rain over summer. In 2022/23 we had `r rain_stats$total_wet_days[rain_stats$summer == '2022/23']`, which is the most of any summer since at least 1965. This summer also had the highest average daily rainfall, at `r round(rain_stats$average_rain[rain_stats$summer == '2022/23'])` mm  when looking at wet days only. However, because of the extreme events in 2022/23, it is probably more useful to look at median rainfall. Looking at median rainfall 2022/23 still ranks `r arrange(rain_stats, desc(median_rain)) %>% {which(.$summer == '2022/23')}``r suffix(arrange(rain_stats, desc(median_rain)) %>% {which(.$summer == '2022/23')})` highest. Even apart from the extreme rain events we experienced, this summer had far more wet days than usual, which also tended to be wetter!
+
+```{r average-comparison-plot, echo = FALSE, fig.dim = c(8, 5), fig.cap = paste0("This summer's daily rainfall record (lower panel) compared to the daily rainfall of ",average_summer," (upper panel), which was a typical summer.")}
+ggplot(data = filter(dec_to_mar, summer %in% c(average_summer, '2022/23'))) +
+  geom_bar(aes(fake_date, amount_mm), stat = 'identity', fill = '#92BAD2', colour = 'black') +
+  facet_wrap(~summer, ncol = 1) +
+  scale_y_continuous(expand = c(0,0,0.05,0)) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = 'bold'),
+    axis.title.y = element_text(colour = '#92BAD2', face = 'bold')
+  ) +
+  labs(
+    x = NULL,
+    y = 'Daily Rainfall (mm)'
+  ) +
+  scale_x_date(date_breaks = '3 days', date_labels = '%b %d', limits = c(as.Date('2022-12-01'), as.Date('2023-02-28')), expand = c(0.02,0.05))
+```
+
+
+## Can we blame it on La Niña?
+
+The [El Niño Southern Oscillation (ENSO)](https://niwa.co.nz/climate/information-and-resources/elnino) is a climate pattern observed across the Pacific Ocean and has two distinct phases. The first is El Niño, which is characterised by a high sea surface air pressure in the western Pacific and warmer surface water temperatures off the coast of South America. Inversely, La Niña is characterised by a migration of that high pressure system to the east, cooler than normal surface water temperatures and stronger than normal easterly trade winds. The most common method for determining which phase we currently sit in uses a standardised pressure differential between sea surface air pressure in Darwin and Tahiti, creating a metric called the southern oscillation index (SOI). 
+
+La Niña is known to cause higher rainfall in the north-easterly parts of the North Island in New Zealand, which is exactly what we saw this summer, a La Niña year. But how does this line up with our historical rain data? A good way to visualise this is to overlay Figure \@ref(fig:summer-rainfall-plot) with the southern oscillation index (\@ref(fig:enso-overlay-plot)).
+
+```{r enso-overlay-plot, echo = FALSE, fig.dim = c(8, 5), fig.cap = "Summer (Dec through Feb) rainfall from 1965 to present at Auckland Airport, overlayed with the Souther Oscillation Index (right axis). The red line indicates periods of El Niño, while the blue indicates La Niña. The line's distance from zero indicates the strength of the current phase."}
+rain_plot +
+  geom_hline(yintercept = 400.2, lty = 2, alpha = 0.5) +
+  scale_y_continuous(
+    name = "Summer Rainfall (mm)",
+    sec.axis = sec_axis( trans=~.*0.007745-3.1, name="Southern Oscillation Index"),
+    expand = c(0,0,0.05,0)
+  ) +
+  geom_line(
+    data = enso_data %>% filter(month(Date) %in% c(12,1,2)) %>%
+      mutate(
+        summer = ifelse(month(Date) == 12, year(Date), year(Date)-1)
+      ) %>% group_by(summer) %>%
+      summarise(index = mean(Index)) %>%
+      {divide_line(.$summer, .$index, at = 0)},
+    aes(x, ymax* 129.1 + 400.2, group = id, colour = as.factor(sign)),
+    size = 1, alpha = 0.5
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    axis.title.y = element_text(colour = '#92BAD2', face = 'bold'),
+    axis.title.y.right = element_text(color = 'black')
+  ) +
+  guides(colour = 'none')
+
+```
+
+We can see that many of the summers where rainfall was higher than normal were La Niña years and many of the drier summers (e.g. 1973'74) were El Niño years. The three summers between 1983/84 and 1985/86 were all well above average, in terms of rainfall, and were marked by a 3 year period of La Niña. All eight years following that period, except one, were either El Niño or weakly La Niña. All eight years had relatively normal levels of rainfall, with only the strongly La Niña year showing higher than normal rainfall. Of course the pattern is not always so consistent. Our previous two summers were also La Niña years and had below average rainfall, for example.
+
+We can have a look at how strongly ENSO affects rainfall at our location by looking at the correlation between total summer rainfall and the average SOI over each summer (\@ref(fig:enso-correlation-plot)). The correlation below shows there is a general pattern of higher rainfall with higher SOI (or stronger La Niña). However, the pattern is surrounded by a lot of noise. The model we fit only explains `r round(glance(lm3)$r.squared*100, digits = 1)`% of the variation in rainfall that we observe between summers. 
+
+```{r enso-correlation-plot, echo = FALSE, fig.dim = c(8, 5), fig.cap = paste0("Correlation between the log of total summer rainfall and the SOI. The data was logged to fulfill assumptions of fitting linear models.")}
+ggplot(enso_correlation, aes(index, log(rain))) + 
+  geom_point() + 
+  geom_line(data = lm3_data, aes(index, log(rain)), col = 'red', size = 1) +
+  theme_bw() + 
+  theme(
+    aspect.ratio = 1
+  ) +
+  labs(x = 'SOI', y = 'log(Summer Rainfall (mm))') +
+  ggpmisc::stat_fit_glance(method = "lm",
+                  method.args = list(formula = 'log(y) ~ x'),
+                  aes(label = sprintf('R^2~"="~%.3f',
+                                      stat(r.squared))),
+                  parse = TRUE,label.x = "left", label.y = "top", col = 'red')
+```
+
+The weak relationship above speaks to the difficulty in identifying relationships within complex (and [chaotic](https://fractalfoundation.org/resources/what-is-chaos-theory/)) systems such as weather. Although large, far away systems, such as ENSO, certainly do have an effect on the day to day weather here in New Zealand, there are many other interacting forces which make finding the exact extent of that relationship difficult. This is why the process of predicting extreme events or daily weather increasingly rely on  sophisticated modelling and enormous databases. 
+
+
+
+
+
